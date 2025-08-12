@@ -530,7 +530,183 @@ void defullbright(const char *filename, bool preview)
 	
 	free(waddata);
 }
+void defullbright_mdl(const char *filename, bool preview)
+{
+    FILE *fp = fopen(filename, "rb+");
+    if (!fp)
+    {
+        printf("defullbright: could not open \"%s\"\n", filename);
+        return;
+    }
 
+    // Read MDL header (fixed 68 bytes)
+    typedef struct {
+        int ident;          // 'IDPO' (0x4F504449)
+        int version;
+        float scale[3];
+        float origin[3];
+        float radius;
+        float eye_position[3];
+        int num_skins;
+        int skinwidth;
+        int skinheight;
+        int num_verts;
+        int num_tris;
+        int num_frames;
+        int synctype;
+        int flags;
+        float size;
+    } mdl_header_t;
+
+    mdl_header_t header;
+    if (fread(&header, sizeof(mdl_header_t), 1, fp) != 1)
+    {
+        printf("defullbright: error reading mdl header in \"%s\"\n", filename);
+        fclose(fp);
+        return;
+    }
+
+    // Check ident
+    if (header.ident != 0x4F504449) // 'IDPO' little endian
+    {
+        printf("defullbright: \"%s\" is not a valid Quake MDL\n", filename);
+        fclose(fp);
+        return;
+    }
+
+    printf("defullbright: processing MDL \"%s\" with %d skins, %d x %d size\n",
+        filename, header.num_skins, header.skinwidth, header.skinheight);
+
+    // Now process skins
+    // Seek to skins data offset = header size (68 bytes)
+    long skins_offset = sizeof(mdl_header_t);
+    fseek(fp, skins_offset, SEEK_SET);
+
+    for (int skin_index = 0; skin_index < header.num_skins; skin_index++)
+    {
+        long skin_start = ftell(fp);
+
+        // Read group type (int)
+        int group_type;
+        if (fread(&group_type, sizeof(int), 1, fp) != 1)
+        {
+            printf("defullbright: error reading skin group type in \"%s\"\n", filename);
+            fclose(fp);
+            return;
+        }
+
+        if (group_type == 0)
+        {
+            // single skin: read pixel data directly
+            int skin_pixels_size = header.skinwidth * header.skinheight;
+            unsigned char *pixels = malloc(skin_pixels_size);
+            if (!pixels)
+            {
+                printf("defullbright: out of memory\n");
+                fclose(fp);
+                return;
+            }
+
+            if (fread(pixels, 1, skin_pixels_size, fp) != skin_pixels_size)
+            {
+                printf("defullbright: error reading skin pixels in \"%s\"\n", filename);
+                free(pixels);
+                fclose(fp);
+                return;
+            }
+
+            bool has_fullbright = false;
+            for (int i = 0; i < skin_pixels_size; i++)
+            {
+                if (IsFullbright(pixels[i]))
+                {
+                    has_fullbright = true;
+                    break;
+                }
+            }
+
+            if (has_fullbright)
+            {
+                printf("defullbright: removing fullbrights from skin %d\n", skin_index);
+                DeFullbrightPixels(pixels, skin_pixels_size, false);
+
+                // Write back modified pixels
+                fseek(fp, skin_start + 4, SEEK_SET); // pixel data starts 4 bytes after group_type
+                fwrite(pixels, 1, skin_pixels_size, fp);
+                fflush(fp);
+            }
+            else
+            {
+                printf("defullbright: skin %d has no fullbrights, skipping\n", skin_index);
+            }
+
+            free(pixels);
+        }
+        else
+        {
+            // group skin: read number of skins
+            int num_group_skins;
+            if (fread(&num_group_skins, sizeof(int), 1, fp) != 1)
+            {
+                printf("defullbright: error reading group skin count in \"%s\"\n", filename);
+                fclose(fp);
+                return;
+            }
+
+            // skip times (num_group_skins * 4 bytes)
+            fseek(fp, num_group_skins * sizeof(int), SEEK_CUR);
+
+            for (int gs = 0; gs < num_group_skins; gs++)
+            {
+                int skin_pixels_size = header.skinwidth * header.skinheight;
+                unsigned char *pixels = malloc(skin_pixels_size);
+                if (!pixels)
+                {
+                    printf("defullbright: out of memory\n");
+                    fclose(fp);
+                    return;
+                }
+
+                if (fread(pixels, 1, skin_pixels_size, fp) != skin_pixels_size)
+                {
+                    printf("defullbright: error reading group skin pixels in \"%s\"\n", filename);
+                    free(pixels);
+                    fclose(fp);
+                    return;
+                }
+
+                bool has_fullbright = false;
+                for (int i = 0; i < skin_pixels_size; i++)
+                {
+                    if (IsFullbright(pixels[i]))
+                    {
+                        has_fullbright = true;
+                        break;
+                    }
+                }
+
+                if (has_fullbright)
+                {
+                    printf("defullbright: removing fullbrights from group skin %d.%d\n", skin_index, gs);
+                    DeFullbrightPixels(pixels, skin_pixels_size, false);
+
+                    // Move file pointer back to write modified pixels
+                    fseek(fp, -skin_pixels_size, SEEK_CUR);
+                    fwrite(pixels, 1, skin_pixels_size, fp);
+                    fflush(fp);
+                }
+                else
+                {
+                    printf("defullbright: group skin %d.%d has no fullbrights, skipping\n", skin_index, gs);
+                }
+
+                free(pixels);
+            }
+        }
+    }
+
+    fclose(fp);
+}
 static void LoadList(const char *filename)
 {
 	printf("Loading list of textures to defullbright from '%s'...\n", filename);
@@ -584,8 +760,13 @@ int main(int argc, char **argv)
 	}
 
 	for (; i<argc; i++)
-		defullbright(argv[i], preview);
-
+	{
+		const char *ext = strrchr(argv[i], '.');
+    	if (ext && !strcmp(ext, ".mdl"))
+        	defullbright_mdl(argv[i], preview);
+    	else
+        	defullbright(argv[i], preview);
+		}
 	if (preview)
 		printf("wrote %d .tga previews of the textures containing fullbrights\n", previews_written);
 
